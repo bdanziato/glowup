@@ -319,7 +319,7 @@ function saveLocal() {
   try { localStorage.setItem(KEY, JSON.stringify(S)); saveOk = true; } catch { saveOk = false; toast('Não consegui salvar neste aparelho. Faça um backup agora.'); }
   setSync();
 }
-function persist() { S.meta.updatedAt = new Date().toISOString(); saveLocal(); }
+function persist() { S.meta.updatedAt = new Date().toISOString(); saveLocal(); schedulePushSync(); }
 function setSync() {
   const el = $('#sync'); if (!el) return; el.className = 'sync ' + (saveOk ? 'ok' : 'err');
   el.title = saveOk ? 'Salvo neste celular' : 'Erro ao salvar';
@@ -671,7 +671,7 @@ function restPaint() {
   const bar = $('#restbar');
   if (!rest) { bar.hidden = true; return; }
   const left = (rest.end - Date.now()) / 1000;
-  if (left <= 0) { rest = null; bar.hidden = true; beep(990); toast('Descanso acabou — próxima série!'); if (S.meta.notif.rest && document.hidden) notify('Descanso acabou', 'Hora da próxima série!', 'rest'); return; }
+  if (left <= 0) { rest = null; bar.hidden = true; beep(990); toast('Descanso acabou — próxima série!'); if (S.meta.notif.rest && document.hidden && !S.meta.push) notify('Descanso acabou', 'Hora da próxima série!', 'rest'); return; }
   if (bar.hidden) { bar.hidden = false; bar.innerHTML = `<div class="inner2"><span class="small" style="opacity:.75">Descanso</span><span class="clock" id="rest-c"></span><button data-act="rest-add" data-n="-15">−15</button><button data-act="rest-add" data-n="15">+15</button><button data-act="rest-skip">Pular</button></div><div class="track"><i id="rest-t"></i></div>`; }
   $('#rest-c').textContent = fmtClock(Math.ceil(left));
   $('#rest-t').style.width = (left / rest.total * 100) + '%';
@@ -681,7 +681,7 @@ function finishSession() {
   const s = { id: a.id, date: a.date, name: a.name, durationSec: Math.round((Date.now() - a.start)/1000),
     exercises: a.exercises.map(e => ({ name: e.name, note: e.note || '', sets: e.sets.filter(x => x.done || x.reps).map(x => ({ kg: n0(x.kg), reps: n0(x.reps), done: x.done ? 1 : 0 })) })).filter(e => e.sets.length),
     cardio: a.cardio.filter(c => n0(c.min) || n0(c.km)).map(c => ({ type: c.type, min: n0(c.min), km: n0(c.km) })) };
-  S.gym.sessions.push(s); S.gym.active = null; rest = null; persist('gym'); closeSession();
+  S.gym.sessions.push(s); S.gym.active = null; if (rest) pushRest(0); rest = null; persist('gym'); closeSession();
   toast(`Treino salvo: ${fmtDur(s.durationSec)} · ${Math.round(volume(s)).toLocaleString('pt-BR')} kg`);
 }
 function histSheet(s) {
@@ -734,7 +734,7 @@ async function notify(title, body, tag) {
   try { new Notification(title, opts); } catch {}
 }
 function checkReminders() {
-  if (!notifOn()) return;
+  if (!notifOn() || S.meta.push) return;
   const n = S.meta.notif, t = today(), now = hmToMin(nowHM()), sent = S.meta.notified; let changed = false;
   for (const k in sent) if (k.slice(-10) < addDays(t, -2)) { delete sent[k]; changed = true; }
   if (n.tasks) for (const x of tasksOn(t)) {
@@ -752,12 +752,57 @@ function checkReminders() {
   if (changed) saveLocal();
 }
 setInterval(checkReminders, 30000);
+
+/* ---------- server push (reminders with the app closed) ---------- */
+const PUSH_KEY = 'BBjQ93ijuijwV_L-ULKHBZ97zy0fwDZ4XJxAsyj1wZ52Gpyj4r5UI4zpDj5XkyNIJdQsBf3vcUbV_cMndaZx8VU';
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && notifSupported();
+function deviceId() { if (!S.meta.deviceId) { S.meta.deviceId = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''); saveLocal(); } return S.meta.deviceId; }
+const tz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo'; } catch { return 'America/Sao_Paulo'; } };
+function b64ToBytes(b64) { const pad = '='.repeat((4 - b64.length % 4) % 4), raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(raw, c => c.charCodeAt(0)); }
+function pushSchedule() {
+  const n = S.meta.notif, t = today(), days = [t, addDays(t, 1), addDays(t, 2)];
+  return {
+    tasks: { on: !!n.tasks, lead: n.lead, items: S.planner.tasks.filter(x => days.includes(x.date) && x.time && !x.done).slice(0, 200).map(x => ({ id: x.id, date: x.date, time: x.time, end: x.end || '', title: x.title.slice(0, 120) })) },
+    water: { on: !!n.water, every: n.waterEvery, goal: S.diet.waterCfg.goal, ml: { [t]: S.diet.waterMl[t] || 0 } },
+    rest: !!n.rest,
+  };
+}
+async function pushPost(body) {
+  const r = await fetch('/api/push', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: deviceId(), tz: tz(), ...body }) });
+  if (!r.ok) throw new Error('push ' + r.status);
+  return r.json();
+}
+let pushT = null;
+function schedulePushSync() {
+  if (!S.meta.push) return;
+  clearTimeout(pushT);
+  pushT = setTimeout(() => pushPost({ action: 'sync', schedule: pushSchedule() }).catch(e => { if (String(e.message).includes('404')) { S.meta.push = false; saveLocal(); } }), 1500);
+}
+function pushRest(end) { if (S.meta.push && S.meta.notif.rest) pushPost({ action: 'rest', end }).catch(() => {}); }
+async function enablePush() {
+  if (!pushSupported()) return false;
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(PUSH_KEY) });
+  await pushPost({ action: 'subscribe', sub: sub.toJSON(), schedule: pushSchedule(), test: true });
+  S.meta.push = true; saveLocal();
+  return true;
+}
+async function disablePush() {
+  try { const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription(); await sub?.unsubscribe(); } catch {}
+  try { await pushPost({ action: 'unsubscribe' }); } catch {}
+  S.meta.push = false; saveLocal();
+}
+// keep the server copy fresh: tasks for today and the next two days, water so far
+if (S.meta.push) { setTimeout(() => pushPost({ action: 'sync', schedule: pushSchedule() }).catch(() => {}), 2000); }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') schedulePushSync(); });
 setTimeout(checkReminders, 3000);
 function notifSection() {
   const n = S.meta.notif, perm = notifSupported() ? Notification.permission : 'unsupported';
   const sw = (key, label, sub) => `<div class="toggle-row"><div><div style="font-weight:600">${label}</div>${sub ? `<div class="small muted">${sub}</div>` : ''}</div><button class="switch" role="switch" aria-checked="${!!n[key]}" aria-label="${label}" data-act="notif-toggle" data-k="${key}"></button></div>`;
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-  const head = perm === 'granted' ? '<p class="small" style="margin:0;color:var(--diet)">Notificações ativadas neste celular.</p>'
+  const head = perm === 'granted' ? (S.meta.push ? '<p class="small" style="margin:0;color:var(--diet)">Ativadas, inclusive com o app fechado.</p><button class="link" style="text-align:left" data-act="notif-test">Enviar um aviso de teste</button>'
+      : `<p class="small" style="margin:0;color:var(--diet)">Ativadas enquanto o app está aberto.</p>${pushSupported() ? '<button class="btn primary block" data-act="notif-ask">Ativar também com o app fechado</button>' : ''}`)
     : perm === 'denied' ? '<p class="small muted" style="margin:0">As notificações foram bloqueadas. Para liberar, vá nos Ajustes do celular → Notificações → Glow Up.</p>'
     : perm === 'unsupported' ? `<p class="small muted" style="margin:0">${standalone ? 'Este celular não oferece notificações para apps da web.' : 'No iPhone, as notificações só funcionam com o app instalado na tela de início (Compartilhar → Adicionar à Tela de Início). Depois abra pelo ícone e volte aqui.'}</p>`
     : '<button class="btn primary block" data-act="notif-ask">Ativar notificações</button>';
@@ -767,7 +812,8 @@ function notifSection() {
     ${sw('water', 'Beber água', `A cada ${n.waterEvery} h, das 8h às 22h, até bater a meta`)}
     <div class="chips" style="padding:4px 0 8px">${[1,2,3].map(v => `<button data-act="notif-water" data-v="${v}" aria-pressed="${n.waterEvery===v}" style="--c:var(--gym)">a cada ${v} h</button>`).join('')}</div>
     ${sw('rest', 'Fim do descanso no treino', 'Avisa se você saiu do app durante o descanso')}</div>
-    <p class="small muted" style="margin:0">Os avisos chegam enquanto o app está aberto ou foi minimizado há pouco. Com o app totalmente fechado o celular não acorda o app para avisar.</p></div>`;
+    <p class="small muted" style="margin:0">${S.meta.push ? 'Para avisar com o app fechado, os horários das tarefas dos próximos 3 dias e a meta de água ficam guardados também no servidor do app. O resto dos seus dados continua só neste celular.' : 'Sem a opção "com o app fechado", os avisos só chegam enquanto o app está aberto ou foi minimizado há pouco.'}</p>
+    ${S.meta.push ? '<button class="link" style="text-align:left" data-act="notif-off">Desligar avisos com o app fechado</button>' : ''}</div>`;
 }
 
 /* ---------- weekly summary ---------- */
@@ -911,17 +957,17 @@ const A = {
   'ses-finish': () => finishSession(),
   'ses-cancel-ask': () => { $('#cancel-zone').innerHTML = `<div class="confirm"><span class="small grow">Descartar este treino? Nada será salvo.</span><button class="btn ghost" data-act="ses-cancel-no">Voltar</button><button class="btn danger" style="background:var(--danger);color:var(--surface)" data-act="ses-cancel-yes">Descartar</button></div>`; },
   'ses-cancel-no': () => renderSession(),
-  'ses-cancel-yes': () => { S.gym.active = null; rest = null; persist('gym'); closeSession(); },
+  'ses-cancel-yes': () => { S.gym.active = null; if (rest) pushRest(0); rest = null; persist('gym'); closeSession(); },
   'set-toggle': el => { const e = S.gym.active.exercises[+el.dataset.ei], s = e.sets[+el.dataset.si]; s.done = s.done ? 0 : 1;
-    if (s.done && e.rest > 0) rest = { end: Date.now() + e.rest * 1000, total: e.rest }; persist('gym'); renderSession(); restPaint(); },
+    if (s.done && e.rest > 0) { rest = { end: Date.now() + e.rest * 1000, total: e.rest }; pushRest(rest.end); } persist('gym'); renderSession(); restPaint(); },
   'set-add': el => { const e = S.gym.active.exercises[+el.dataset.ei], l = e.sets[e.sets.length-1]; e.sets.push({ kg: l?.kg ?? '', reps: l?.reps ?? 10, prev:'', done:0 }); persist('gym'); renderSession(); },
   'ex-move': el => { const x = S.gym.active.exercises, i = +el.dataset.ei, j = i + (+el.dataset.d); if (j < 0 || j >= x.length) return; [x[i], x[j]] = [x[j], x[i]]; persist('gym'); renderSession(); },
   'ex-rm': el => { S.gym.active.exercises.splice(+el.dataset.ei, 1); persist('gym'); renderSession(); },
   'ex-add': () => { const n = $('#new-ex').value.trim(); if (!n) { $('#new-ex').focus(); return; } S.gym.active.exercises.push({ name: n, rest: 60, sets: [{ kg:'', reps:12, prev:'', done:0 }, { kg:'', reps:12, prev:'', done:0 }, { kg:'', reps:12, prev:'', done:0 }] }); persist('gym'); renderSession(); },
   'cardio-add': () => { S.gym.active.cardio.push({ type:'Esteira', min:'', km:'' }); persist('gym'); renderSession(); },
   'cardio-rm': el => { S.gym.active.cardio.splice(+el.dataset.ci, 1); persist('gym'); renderSession(); },
-  'rest-add': el => { if (rest) { rest.end += +el.dataset.n * 1000; rest.total = Math.max(rest.total, (rest.end - Date.now())/1000); restPaint(); } },
-  'rest-skip': () => { rest = null; restPaint(); },
+  'rest-add': el => { if (rest) { rest.end += +el.dataset.n * 1000; rest.total = Math.max(rest.total, (rest.end - Date.now())/1000); pushRest(rest.end); restPaint(); } },
+  'rest-skip': () => { rest = null; pushRest(0); restPaint(); },
   'hist-open': el => histSheet(S.gym.sessions.find(s => s.id === el.dataset.id)),
   'sw-mode': el => { sw.mode = el.dataset.v; $('#swcard').outerHTML = swCard(); swPaint(); },
   'sw-toggle': () => { if (sw.running) { sw.acc += Date.now() - sw.start; sw.running = false; } else { sw.start = Date.now(); sw.running = true; } $('#sw-tbtn').textContent = sw.running ? 'Pausar' : 'Iniciar'; swPaint(); },
@@ -942,10 +988,20 @@ const A = {
     persist('glow'); closeSheet(); toast('Rotina atualizada');
   },
   summary: () => summarySheet(),
-  'notif-ask': async () => { try { await Notification.requestPermission(); } catch {} $('#notif-zone').innerHTML = notifSection(); if (notifOn()) { notify('Glow Up', 'Pronto! Você vai receber os avisos por aqui.', 'hello'); checkReminders(); } },
-  'notif-toggle': el => { const k = el.dataset.k; S.meta.notif[k] = !S.meta.notif[k]; saveLocal(); $('#notif-zone').innerHTML = notifSection(); },
-  'notif-lead': el => { S.meta.notif.lead = +el.dataset.v; saveLocal(); $('#notif-zone').innerHTML = notifSection(); },
-  'notif-water': el => { S.meta.notif.waterEvery = +el.dataset.v; saveLocal(); $('#notif-zone').innerHTML = notifSection(); },
+  'notif-ask': async el => {
+    el.disabled = true; el.textContent = 'Ativando…';
+    try { if (Notification.permission !== 'granted') await Notification.requestPermission(); } catch {}
+    if (notifOn()) {
+      let ok = false; try { ok = await enablePush(); } catch (e) { console.error(e); }
+      if (!ok) { notify('Glow Up', 'Pronto! Você vai receber os avisos enquanto o app estiver aberto.', 'hello'); toast('Não consegui ativar com o app fechado. Os avisos funcionam com o app aberto.'); checkReminders(); }
+    }
+    if ($('#notif-zone')) $('#notif-zone').innerHTML = notifSection();
+  },
+  'notif-test': async () => { try { await pushPost({ action: 'subscribe', sub: (await (await navigator.serviceWorker.ready).pushManager.getSubscription()).toJSON(), schedule: pushSchedule(), test: true }); toast('Aviso de teste enviado'); } catch { toast('Não consegui enviar o teste'); } },
+  'notif-off': async () => { await disablePush(); if ($('#notif-zone')) $('#notif-zone').innerHTML = notifSection(); toast('Avisos com o app fechado desligados'); },
+  'notif-toggle': el => { const k = el.dataset.k; S.meta.notif[k] = !S.meta.notif[k]; saveLocal(); schedulePushSync(); $('#notif-zone').innerHTML = notifSection(); },
+  'notif-lead': el => { S.meta.notif.lead = +el.dataset.v; saveLocal(); schedulePushSync(); $('#notif-zone').innerHTML = notifSection(); },
+  'notif-water': el => { S.meta.notif.waterEvery = +el.dataset.v; saveLocal(); schedulePushSync(); $('#notif-zone').innerHTML = notifSection(); },
   export: () => {
     const data = exportJSON(), name = `glowup-backup-${today()}.json`;
     const file = new File([data], name, { type: 'application/json' });

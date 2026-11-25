@@ -1,5 +1,5 @@
 // Glow Up service worker: keeps the app working offline.
-const CACHE = 'glowup-v3';
+const CACHE = 'glowup-v4';
 const CORE = ['/', '/index.html', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
@@ -23,4 +23,9 @@ self.addEventListener('notificationclick', e => {
   e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
     const c = cs.find(x => 'focus' in x); return c ? c.focus() : self.clients.openWindow('/');
   }));
+});
+// Reminders sent by the server (tasks, water, rest timer) arrive here even with the app closed.
+self.addEventListener('push', e => {
+  let d = {}; try { d = e.data ? e.data.json() : {}; } catch { d = { title: 'Glow Up', body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'Glow Up', { body: d.body || '', tag: d.tag || 'glowup', renotify: true, icon: '/icon-192.png', badge: '/icon-192.png', vibrate: [200, 100, 200] }));
 });
